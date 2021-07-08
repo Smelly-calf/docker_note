@@ -1,0 +1,166 @@
+#!/usr/bin/groovy
+
+properties(
+        [
+                parameters([
+                        string(defaultValue:'',
+                                description:'upstream git project id',
+                                name:'PROJECT_ID')
+                ]),
+                pipelineTriggers([
+                                [
+                                    $class: 'GitLabPushTrigger',
+                                    triggerOnPush: true, // push event trigger
+                                    triggerOnMergeRequest: true, // merge event trigger
+                                    triggerOpenMergeRequestOnPush: "never", // <never | source | both>
+                                    triggerOnNoteRequest: true, // note event trigger
+                                    noteRegex: "Jenkins please retry a build", // note filter regex
+                                    skipWorkInProgressMergeRequest: true, // skip WIP merge request
+                                    secretToken: "", // your secret project token
+                                    ciSkip: false, // skip ci
+                                    setBuildDescription: true, // set event info on build description
+                                    addNoteOnMergeRequest: true,
+                                    addCiMessage: true,
+                                    addVoteOnMergeRequest: true,
+                                    acceptMergeRequestOnSuccess: false, // accept merge when job build success
+                                    branchFilterType: "All" //  Allow all branches to trigger this job
+                                ]
+                ])
+        ]
+)
+
+def podLabel = "k8s-${env.JOB_BASE_NAME}"
+def imagePre = ""
+podTemplate(name: podLabel, label: podLabel, cloud: "" ,nodeUsageMode:'EXCLUSIVE',
+        containers: [
+                containerTemplate(
+                        name: 'build-container',
+                        image: "",
+                        alwaysPullImage: true,
+                        ttyEnabled: true,
+                        command: 'cat'
+                ),
+                containerTemplate(
+                        name: 'deploy-container',
+                        image: "",
+                        ttyEnabled: true,
+                        alwaysPullImage: true,
+                        command: 'cat'
+                )
+        ],
+        // 同步宿主机和容器的时间
+        volumes:[
+                hostPathVolume(hostPath:'/etc/localtime', mountPath:'/etc/localtime'),
+        ])
+        {
+            node(podLabel) {
+                gitlabBuilds(builds: ["Download code", "deploy"]){ // predefine stage in gitlab pipeline, status is pending
+//                     gitlabCommitStatus(name: 'adminserver_pipeline', connection:gitLabConnection('gitlab'), // name: gitlab pipeline 显示的名字， connection：gitlab连接，必须用这个值
+//                             builds: [ // builds 是可选项，默认会写回到下载代码的project的repo，如果需要指定，配置这个值，如果下游job需要update 上游的代码库的状态，需要通过参数将projectId和lastCommit传递下来
+//                                [projectId: params.PROJECT_ID, revisionHash: params.LAST_COMMIT],
+//                             ]
+//                     )
+//                     {
+                    try{
+                        def credentialsId = ""
+                        def gitUrl = ""
+                        def localDir = ""
+                        stage('Download code'){
+                            def checkoutResult = checkout([
+                                    $class                           : 'GitSCM',
+                                    branches                         : [[name: "*/${env.gitlabSourceBranch}"]], //branches: [[name: "origin/${gitlabSourceBranch}", "merge-requests/${gitlabMergeRequestIid}"]]
+                                    doGenerateSubmoduleConfigurations: false,
+                                    extensions                       : [
+                                                                        [
+                                                                                $class: 'RelativeTargetDirectory',
+                                                                                relativeTargetDir: localDir
+                                                                        ],
+                                                                        [
+                                                                                $class: "CleanBeforeCheckout",
+                                                                        ],
+                                                                        [
+                                                                                $class: 'AuthorInChangelog'
+                                                                        ],
+                                                                        [
+                                                                                $class : 'PreBuildMerge', // merge code before build, used in merge request trigger
+                                                                                options: [
+                                                                                        fastForwardMode: 'FF',
+                                                                                        mergeRemote    : "origin",
+                                                                                        mergeTarget    : "${env.gitlabTargetBranch}"
+                                                                                ]
+                                                                        ]
+
+                                    ],
+                                    submoduleCfg                     : [],
+                                    userRemoteConfigs                : [
+                                            [
+                                                credentialsId: credentialsId,
+                                                name         : "origin",
+                                                url          : "${env.gitlabSourceRepoHttpUrl}"
+                                            ]
+                                    ]
+                            ])
+                            commitId = checkoutResult.GIT_COMMIT.substring(0, 7)
+                            tagId = checkoutResult.GIT_TAG_NAME
+                            if (tagId == null)
+                                tagId = "1.0"
+                            println "commitId: ${commitId}"
+                            println "tagId: ${tagId}"
+                        }
+
+
+                        stage('deploy') {
+                            container("build-container"){
+                                def remote = [:]
+                                remote.name = ''
+                                remote.host = ''
+                                remote.user = ''
+                                remote.password = ''
+                                remote.allowAnyHosts = true
+                                def jobName = "${env.JOB_NAME}".split("/")[-1]
+                                def remoteDir = "/data/${jobName}_${env.gitlabSourceBranch}"
+                                echo "remote directory: ${remoteDir}"
+
+                                writeFile file: 'deploy.sh', text: '''
+                                    ls -lrt
+                                    if [ -d "$remoteDir" ];then
+                                        rm -rf "$remoteDir"
+                                    fi
+                                    mkdir -p "$remoteDir"
+                                    echo "Recreate ${remoteDir} finished."
+                                    '''
+                                new File("deploy.sh").eachLine { line ->
+                                        println line
+                                    }
+                                sshScript remote: remote, script: 'deploy.sh'
+        //                         sh('mv ../adminserver_pipline ../adminserver_test-push')
+                                sshPut remote: remote, from: "/home/jenkins/workspace/${env.JOB_NAME}/.", into: "$remoteDir"
+                            }
+
+                        }
+                        build(
+                                job: "",
+                                propagate: true,
+                                parameters: [
+                                        [
+                                                $class: 'StringParameterValue',
+                                                name  : 'LAST_COMMIT',
+                                                value : "${env.gitlabMergeRequestLastCommit}"
+                                        ],
+                                        [
+                                                $class: 'StringParameterValue',
+                                                name  : 'PROJECT_ID',
+                                                value : "${env.gitlabMergeRequestTargetProjectId}"
+                                        ]
+                                ]
+                        )
+                        updateGitlabCommitStatus(name: 'build', state: 'success')
+                    }catch (Exception e) {
+                         updateGitlabCommitStatus(name: 'build', state: 'failed')
+                         addGitLabMRComment comment: "Something unexpected happened. Inspect Jenkins logs."
+                         throw e
+                        }
+                    }
+//              }
+            }
+       }
