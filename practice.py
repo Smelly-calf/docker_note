@@ -1,13 +1,14 @@
 # coding=utf-8
 # 快排：一次遍历需要O(N)时间，递归深度 O(logN)，总共需要 O(NlogN) 时间复杂度。
 def test(li1, start, end):
-    # 必须加判断条件：否则会造成递归栈溢出（思考为什么）
+    # 递归结束的条件：子数组中只有一个元素
     if start >= end:
         return
     mid = start
     # i和j:队头和队尾指针，移动的是i 和 j，不是 start 和 end
     i = start
     j = end
+    # 循环结束的条件，i遇到j
     while i < j:
         # j：比 mid 的值小的元素下标
         while i < j and li1[j] >= li1[mid]:
